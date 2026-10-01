@@ -4,9 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>導師手札 - 點名與通知系統 (最終完整版)</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;700&display=swap" rel="stylesheet">
+    <!-- 外部資源一律非阻塞載入。改為 async / media="print" 後，即使 CDN 被校園網路攔住
+         或連線沒有回應，HTML 解析與初始化都不會被卡住（之前會整頁空白、按什麼都沒反應）。 -->
+    <script src="https://cdn.tailwindcss.com" async></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet" media="print" onload="this.media='all'">
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
     <style>
         :root {
             --theme-dark: #78350f;
@@ -109,6 +111,24 @@
         }
 
         input[type="file"] { display: none; }
+
+        /* --- 離線備援樣式 --- */
+        /* Tailwind CDN 若載入失敗，.hidden 等工具類別就不存在，兩個對話框會直接攤在頁面上，
+           看起來像是畫面壞掉。以下為最低限度的保險，載入成功時與 Tailwind 行為一致。 */
+        .hidden { display: none !important; }
+        .fixed { position: fixed; }
+        .inset-0 { top: 0; right: 0; bottom: 0; left: 0; }
+        .flex { display: flex; }
+        .items-center { align-items: center; }
+        .justify-center { justify-content: center; }
+        .z-50 { z-index: 50; }
+
+        #offlineNotice {
+            display: none; max-width: 64rem; margin: 0 auto 12px; padding: 8px 14px;
+            border: 1px solid var(--theme-border); border-radius: 8px;
+            background-color: var(--theme-paper); color: var(--theme-dark);
+            font-size: 0.875rem; text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -116,6 +136,11 @@
     <!-- === 螢幕顯示區 === -->
     <div class="screen-only min-h-screen p-4 md:p-8 flex flex-col">
         <div class="max-w-5xl mx-auto flex-grow w-full">
+            <!-- 外部樣式/字型載入失敗時才顯示 -->
+            <div id="offlineNotice">
+                <strong>提示：</strong>目前連不到外部樣式與字型服務，畫面外觀會比較樸素，但點名、通知與列印功能都可正常使用。
+            </div>
+
             <!-- 頂部控制列 -->
             <div class="flex flex-col md:flex-row justify-between items-center mb-6 gap-4">
                 <h1 class="text-3xl font-bold flex items-center gap-2">
@@ -292,10 +317,11 @@
 
     <script>
         // --- 初始化與基礎邏輯 ---
-        const students = [
-            { id: 1, name: '王小明' }, { id: 2, name: '陳語彤' }, { id: 3, name: '林子軒' },
-            { id: 4, name: '張凱婷' }, { id: 5, name: '黃俊傑' }, { id: 6, name: '李明' }, { id: 7, name: '歐陽震華' }
-        ];
+        // uid：內部唯一識別碼，永不重複，用來索引勾選狀態
+        // id ：顯示用座號，允許老師自行編號（即使重複也不會互相影響）
+        let nextUid = 1;
+        const students = ['王小明', '陳語彤', '林子軒', '張凱婷', '黃俊傑', '李明', '歐陽震華']
+            .map((name, i) => ({ uid: nextUid++, id: i + 1, name }));
 
         const templates = {
             polite: { greeting: "各位家長您好，今日班級狀況提醒：\n", absent: "【未到校名單】：", consent: "【未交同意書】：", notice: "【未交通知單】：", footer: "\n再麻煩家長協助留意並督促孩子，感謝您的配合！導師 敬上。" },
@@ -303,17 +329,65 @@
             urgent: { greeting: "【‼️重要班級通知‼️】家長您好，以下為急需處理之事項：\n", absent: "⚠️ 今日未到校 (盡速聯繫導師)：", consent: "⚠️ 同意書逾期未交：", notice: "⚠️ 通知單逾期未交：", footer: "\n為保障學生權益，請名單上的家長【務必於明日】讓學生繳回相關表單，或主動與導師聯繫。謝謝！" }
         };
 
+        const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
         let statusData = {};
         let uploadedImageFile = null;
+        let uploadedImageUrl = null;
 
-        window.onload = () => {
-            const today = new Date();
-            document.getElementById('currentDate').innerText = `${today.getFullYear()}/${today.getMonth()+1}/${today.getDate()}`;
-            const binder = document.getElementById('binderHoles');
-            for(let i=0; i<15; i++) binder.innerHTML += `<div class="hole"></div>`;
-            renderStudentList();
-            updatePreview();
-        };
+        // --- 小工具 ---
+
+        // 名單或註解若含 < > & 等字元，直接寫進 HTML 會破壞版面，一律先轉義
+        function escapeHtml(value) {
+            return String(value === null || value === undefined ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        function formatSeat(id) {
+            return String(id).padStart(2, '0');
+        }
+
+        // 取得（必要時補建）某位學生的勾選狀態，避免因為缺資料而整個流程中斷
+        function ensureStatus(uid) {
+            if (!statusData[uid]) statusData[uid] = { absent: false, consent: false, notice: false };
+            return statusData[uid];
+        }
+
+        // --- 啟動 ---
+        // 改用 DOMContentLoaded：不再等 CDN 的字型與樣式表。
+        // 原本綁在 window.onload，只要有任一外部資源連線沒回應（校園防火牆、Wi-Fi 不穩），
+        // onload 就永遠不會觸發，畫面會一直空白、按什麼都沒反應，看起來就像當機。
+        function init() {
+            try {
+                const today = new Date();
+                document.getElementById('currentDate').innerText =
+                    `${today.getFullYear()}/${today.getMonth() + 1}/${today.getDate()}`;
+                // 一次組好字串再寫入，避免在迴圈裡反覆重繪
+                document.getElementById('binderHoles').innerHTML = '<div class="hole"></div>'.repeat(15);
+                renderStudentList();
+                updatePreview();
+            } catch (err) {
+                console.error('初始化失敗', err);
+            }
+            watchExternalStyles();
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            init();
+        }
+
+        // Tailwind CDN 若在 6 秒內沒載入，提示外觀會比較樸素，但功能不受影響
+        function watchExternalStyles() {
+            setTimeout(() => {
+                if (!window.tailwind) {
+                    const banner = document.getElementById('offlineNotice');
+                    if (banner) banner.style.display = 'block';
+                }
+            }, 6000);
+        }
 
         function setTheme(color) {
             const root = document.documentElement;
@@ -324,69 +398,101 @@
 
         function renderStudentList() {
             const tbody = document.getElementById('studentList');
-            tbody.innerHTML = '';
-            students.forEach(student => {
-                if(!statusData[student.id]) statusData[student.id] = { absent: false, consent: false, notice: false };
-                const tr = document.createElement('tr');
-                tr.className = "border-b border-current/20 hover:bg-black/5 transition";
-                tr.innerHTML = `
-                    <td class="py-1">${student.id.toString().padStart(2,'0')} ${student.name}</td>
-                    <td class="text-center"><input type="checkbox" class="custom-checkbox" onchange="toggleStatus(${student.id}, 'absent', this.checked)" ${statusData[student.id].absent ? 'checked' : ''}></td>
-                    <td class="text-center"><input type="checkbox" class="custom-checkbox" onchange="toggleStatus(${student.id}, 'consent', this.checked)" ${statusData[student.id].consent ? 'checked' : ''}></td>
-                    <td class="text-center"><input type="checkbox" class="custom-checkbox" onchange="toggleStatus(${student.id}, 'notice', this.checked)" ${statusData[student.id].notice ? 'checked' : ''}></td>
-                `;
-                tbody.appendChild(tr);
+            const rows = students.map(student => {
+                const status = ensureStatus(student.uid);
+                const box = (type) =>
+                    `<td class="text-center"><input type="checkbox" class="custom-checkbox" onchange="toggleStatus(${student.uid}, '${type}', this.checked)" ${status[type] ? 'checked' : ''}></td>`;
+                return `
+                    <tr class="border-b border-current/20 hover:bg-black/5 transition">
+                        <td class="py-1">${escapeHtml(formatSeat(student.id))} ${escapeHtml(student.name)}</td>
+                        ${box('absent')}${box('consent')}${box('notice')}
+                    </tr>`;
             });
+            tbody.innerHTML = rows.join('');
         }
 
-        function toggleStatus(id, type, isChecked) {
-            statusData[id][type] = isChecked;
+        function toggleStatus(uid, type, isChecked) {
+            ensureStatus(uid)[type] = isChecked;
             updatePreview();
         }
 
         function handleImageUpload(event) {
-            const file = event.target.files[0];
-            if (file) {
-                uploadedImageFile = file;
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    document.getElementById('imagePreview').src = e.target.result;
-                    document.getElementById('imagePreviewContainer').classList.remove('hidden');
-                }
-                reader.readAsDataURL(file); updatePreview();
+            const input = event.target;
+            const file = input.files && input.files[0];
+            if (!file) return;
+
+            if (!/^image\//.test(file.type)) {
+                showModal('格式不支援', '請選擇圖片檔（JPG、PNG 等）。', 'error');
+                input.value = '';
+                return;
+            }
+            // 手機直拍的照片動輒 5~10MB，轉成 base64 會膨脹約 1.37 倍塞進網頁，
+            // 在記憶體較小的電腦上足以讓瀏覽器卡住沒有回應，因此先攔下來。
+            if (file.size > MAX_IMAGE_BYTES) {
+                showModal('圖片太大', `這張圖片有 ${(file.size / 1024 / 1024).toFixed(1)} MB，超過 ${MAX_IMAGE_BYTES / 1024 / 1024} MB 上限。<br>請先壓縮或改用解析度小一點的照片，以免瀏覽器變慢或沒有回應。`, 'error');
+                input.value = '';
+                return;
+            }
+
+            releaseImageUrl();
+            uploadedImageFile = file;
+            // 用 createObjectURL 取代 FileReader + base64：幾乎不佔記憶體，也不用等讀檔
+            uploadedImageUrl = URL.createObjectURL(file);
+
+            const preview = document.getElementById('imagePreview');
+            preview.onerror = () => {
+                showModal('讀取失敗', '這張圖片無法顯示，請換一張試試。', 'error');
+                clearImage();
+            };
+            preview.src = uploadedImageUrl;
+            document.getElementById('imagePreviewContainer').classList.remove('hidden');
+            updatePreview();
+        }
+
+        function releaseImageUrl() {
+            if (uploadedImageUrl) {
+                URL.revokeObjectURL(uploadedImageUrl);
+                uploadedImageUrl = null;
             }
         }
 
         function clearImage() {
-            uploadedImageFile = null; document.getElementById('imageInput').value = '';
+            releaseImageUrl();
+            uploadedImageFile = null;
+            document.getElementById('imageInput').value = '';
             document.getElementById('imagePreviewContainer').classList.add('hidden');
-            document.getElementById('imagePreview').src = ''; updatePreview();
+            document.getElementById('imagePreview').removeAttribute('src');
+            updatePreview();
         }
 
         function getMaskedName(student) {
-            const mode = document.querySelector('input[name="privacyMode"]:checked').value;
-            const paddedId = student.id.toString().padStart(2, '0');
-            if (mode === 'number') return `${paddedId}號`;
-            else if (mode === 'mask') {
-                const name = student.name;
-                let maskedName = "";
-                if (name.length <= 2) maskedName = name.substring(0, 1) + "Ｏ";
-                else if (name.length === 3) maskedName = name.substring(0, 1) + "Ｏ" + name.substring(2);
-                else maskedName = name.substring(0, 2) + "Ｏ".repeat(name.length - 3) + name.substring(name.length - 1);
-                return `${paddedId}號 ${maskedName}`;
-            } else return `${paddedId}號 ${student.name}`;
+            const checked = document.querySelector('input[name="privacyMode"]:checked');
+            const mode = checked ? checked.value : 'mask';
+            const paddedId = formatSeat(student.id);
+            const name = (student.name || '').trim();
+
+            if (mode === 'number' || !name) return `${paddedId}號`;
+            if (mode !== 'mask') return `${paddedId}號 ${name}`;
+
+            let maskedName;
+            if (name.length === 1) maskedName = name;                                     // 單字姓名不補圈，避免變成假名字
+            else if (name.length === 2) maskedName = name.charAt(0) + 'Ｏ';
+            else if (name.length === 3) maskedName = name.charAt(0) + 'Ｏ' + name.charAt(2);
+            else maskedName = name.substring(0, 2) + 'Ｏ'.repeat(name.length - 3) + name.charAt(name.length - 1);
+            return `${paddedId}號 ${maskedName}`;
         }
 
         function generateMessageText() {
-            const selectedTone = document.querySelector('input[name="tone"]:checked').value;
-            const t = templates[selectedTone];
+            const checkedTone = document.querySelector('input[name="tone"]:checked');
+            const t = templates[checkedTone ? checkedTone.value : 'polite'] || templates.polite;
             let absentList = [], consentList = [], noticeList = [];
 
             students.forEach(s => {
+                const status = ensureStatus(s.uid);
                 const displayName = getMaskedName(s);
-                if(statusData[s.id].absent) absentList.push(displayName);
-                if(statusData[s.id].consent) consentList.push(displayName);
-                if(statusData[s.id].notice) noticeList.push(displayName);
+                if (status.absent) absentList.push(displayName);
+                if (status.consent) consentList.push(displayName);
+                if (status.notice) noticeList.push(displayName);
             });
 
             let finalMsg = "", hasContent = false;
@@ -411,30 +517,30 @@
         // ==========================================
         function printSlips() {
             const printArea = document.getElementById('printArea');
-            printArea.innerHTML = ''; 
             let hasAnyNotice = false;
-            
+
             const today = new Date();
             const dateStr = `${today.getFullYear()}/${today.getMonth()+1}/${today.getDate()}`;
+            const annotationRaw = document.getElementById('imageAnnotation').value.trim();
+            const annotationHtml = annotationRaw
+                ? `<p style="font-size:12px; margin-top:8px; border-top:1px dashed #ccc; padding-top:5px;"><strong>導師叮嚀：</strong><br>${escapeHtml(annotationRaw).replace(/\n/g, '<br>')}</p>`
+                : '';
 
+            const slips = [];
             students.forEach(s => {
-                const status = statusData[s.id];
-                if (status.absent || status.consent || status.notice) {
-                    hasAnyNotice = true;
-                    const slip = document.createElement('div');
-                    slip.className = 'slip-card';
-                    
-                    const boxAbsent = status.absent ? '☑️ <strong style="color:black;">今日未到校</strong>' : '<span style="color:#999;">☐ 今日未到校</span>';
-                    const boxConsent = status.consent ? '☑️ <strong style="color:black;">未繳交同意書</strong>' : '<span style="color:#999;">☐ 未繳交同意書</span>';
-                    const boxNotice = status.notice ? '☑️ <strong style="color:black;">未繳交通知單</strong>' : '<span style="color:#999;">☐ 未繳交通知單</span>';
+                const status = ensureStatus(s.uid);
+                if (!status.absent && !status.consent && !status.notice) return;
+                hasAnyNotice = true;
 
-                    const annotation = document.getElementById('imageAnnotation').value.trim();
-                    const annotationHtml = annotation ? `<p style="font-size:12px; margin-top:8px; border-top:1px dashed #ccc; padding-top:5px;"><strong>導師叮嚀：</strong><br>${annotation}</p>` : '';
+                const boxAbsent = status.absent ? '☑️ <strong style="color:black;">今日未到校</strong>' : '<span style="color:#999;">☐ 今日未到校</span>';
+                const boxConsent = status.consent ? '☑️ <strong style="color:black;">未繳交同意書</strong>' : '<span style="color:#999;">☐ 未繳交同意書</span>';
+                const boxNotice = status.notice ? '☑️ <strong style="color:black;">未繳交通知單</strong>' : '<span style="color:#999;">☐ 未繳交通知單</span>';
 
-                    slip.innerHTML = `
+                slips.push(`
+                    <div class="slip-card">
                         <h3 style="text-align:center; margin:0 0 10px 0; border-bottom:2px solid #000; padding-bottom:5px;">📌 導師通知單</h3>
                         <div style="display:flex; justify-content:space-between; font-size:13px; margin-bottom:10px;">
-                            <span><strong>${s.id.toString().padStart(2,'0')}號 ${s.name}</strong> 的家長 您好：</span>
+                            <span><strong>${escapeHtml(formatSeat(s.id))}號 ${escapeHtml(s.name)}</strong> 的家長 您好：</span>
                             <span>日期：${dateStr}</span>
                         </div>
                         <p style="font-size:13px; margin-bottom:5px;">貴子弟今日有以下事項需您協助配合：</p>
@@ -447,15 +553,16 @@
                         <div style="margin-top:25px; text-align:right; font-size:14px;">
                             家長簽章：<span style="display:inline-block; width:120px; border-bottom:1px solid #000;"></span>
                         </div>
-                    `;
-                    printArea.appendChild(slip);
-                }
+                    </div>`);
             });
 
             if (!hasAnyNotice) {
+                printArea.innerHTML = '';
                 showModal('提示', '目前沒有任何學生被勾選未交事項，不需要列印喔！', 'error');
                 return;
             }
+
+            printArea.innerHTML = slips.join('');
             window.print();
         }
 
@@ -463,58 +570,82 @@
         // 複製到剪貼簿的核心函式 (相容 iFrame 與本機端)
         // ==========================================
         function executeCopy(text) {
+            const previousFocus = document.activeElement;
             const textArea = document.createElement("textarea");
             textArea.value = text;
+            textArea.setAttribute('readonly', '');            // 避免手機彈出鍵盤
+            textArea.setAttribute('aria-hidden', 'true');
             textArea.style.position = "fixed";
+            textArea.style.top = "0";                          // 不要用 -9999px，否則部分瀏覽器會捲動畫面
             textArea.style.left = "-9999px";
+            textArea.style.opacity = "0";
             document.body.appendChild(textArea);
-            textArea.focus();
-            textArea.select();
+
             let successful = false;
             try {
+                textArea.focus();
+                textArea.select();
+                if (textArea.setSelectionRange) textArea.setSelectionRange(0, text.length);
                 successful = document.execCommand('copy');
             } catch (err) {
                 console.error('複製失敗', err);
             }
             document.body.removeChild(textArea);
+            if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
+
+            // execCommand 失敗時（新版瀏覽器逐步淘汰）再試非同步剪貼簿 API
+            if (!successful && navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).catch(() => {});
+            }
             return successful;
         }
 
         // ==========================================
         // 其他發送邏輯
         // ==========================================
+        const SECURITY_HINT = '<br><br><hr class="my-3 border-gray-300"><span class="text-red-600 font-bold text-sm"><i class="fa-solid fa-triangle-exclamation"></i> 提醒：如使用公用電腦，離開前請記得登出您的 LINE 帳號！</span>';
+
         function sendViaLineApp() {
             // 直接抓取 textarea 內 (可能被老師手動編輯過) 的文字
             const msg = document.getElementById('messagePreview').value.trim();
             if(msg === "" || msg.includes("無任何通知事項")) { showModal('提示', '請先勾選名單再發送喔！', 'error'); return; }
-            
-            // 雙重保險：自動複製到剪貼簿
-            const isCopied = executeCopy(msg);
 
-            const encodedMsg = encodeURIComponent(msg);
-            
-            // 使用最原始且穩定的 scheme，直接當作純文字帶入聊天室
-            const lineUrl = `https://line.me/R/msg/text/?${encodedMsg}`;
-            
             if (uploadedImageFile) {
                 const proceed = confirm("💡 貼心提醒：\n「一鍵開啟 LINE」只能帶文字。\n要連圖片一起傳請改用黑色的「手機分享」。\n確定只傳文字嗎？");
                 if(!proceed) return;
             }
-            window.open(lineUrl, '_blank');
+
+            // 雙重保險：自動複製到剪貼簿
+            const isCopied = executeCopy(msg);
+
+            // 使用最原始且穩定的 scheme，直接當作純文字帶入聊天室
+            const lineUrl = `https://line.me/R/msg/text/?${encodeURIComponent(msg)}`;
+            const opened = window.open(lineUrl, '_blank');
+
+            if (!opened) {
+                showModal('無法開啟 LINE', (isCopied
+                    ? '瀏覽器阻擋了彈出視窗。<br>訊息已經為您<strong>自動複製</strong>，請自行開啟 LINE 後貼上即可。'
+                    : '瀏覽器阻擋了彈出視窗，也無法自動複製。<br>請按「複製文字」後自行開啟 LINE 貼上。') + SECURITY_HINT, 'error');
+                return;
+            }
 
             // 顯示成功與貼心提醒提示 (包含登出安全警告)
             setTimeout(() => {
                 const hintMessage = isCopied 
-                    ? '✅ 訊息已經為您「自動複製」了！<br><br>如果在 LINE 裡面沒有出現文字，<br>請直接在聊天室<strong>【在這裡複製貼上您的訊息】</strong>即可發送。<br><br><hr class="my-3 border-gray-300"><span class="text-red-600 font-bold text-sm"><i class="fa-solid fa-triangle-exclamation"></i> 提醒：如使用公用電腦，離開前請記得登出您的 LINE 帳號！</span>'
-                    : '開啟 LINE 成功！<br><br>請直接在聊天室<strong>【在這裡複製貼上您的訊息】</strong>即可發送。<br><br><hr class="my-3 border-gray-300"><span class="text-red-600 font-bold text-sm"><i class="fa-solid fa-triangle-exclamation"></i> 提醒：如使用公用電腦，離開前請記得登出您的 LINE 帳號！</span>';
-                
+                    ? '✅ 訊息已經為您「自動複製」了！<br><br>如果在 LINE 裡面沒有出現文字，<br>請直接在聊天室<strong>【在這裡複製貼上您的訊息】</strong>即可發送。' + SECURITY_HINT
+                    : '開啟 LINE 成功！<br><br>請直接在聊天室<strong>【在這裡複製貼上您的訊息】</strong>即可發送。' + SECURITY_HINT;
+
                 showModal('跳轉提示', hintMessage, 'success');
             }, 500);
         }
 
         async function nativeShare() {
             const msg = document.getElementById('messagePreview').value.trim();
-            if(msg === "" || msg.includes("無任何通知事項") && !uploadedImageFile) { showModal('提示', '沒有要分享的內容', 'error'); return; }
+            // 括號不可省略：原本寫成 a || b && c，會先算 b && c，導致有圖片時仍被判定成沒有內容
+            if ((msg === "" || msg.includes("無任何通知事項")) && !uploadedImageFile) {
+                showModal('提示', '沒有要分享的內容', 'error');
+                return;
+            }
             if (navigator.share) {
                 try {
                     const shareData = { title: '導師手札通知', text: msg };
@@ -552,17 +683,29 @@
             document.getElementById('importModal').classList.remove('hidden');
         }
         function closeImportModal() { document.getElementById('importModal').classList.add('hidden'); }
+
         function processImport() {
             const lines = document.getElementById('importTextarea').value.split('\n').map(line => line.trim()).filter(line => line.length > 0);
             if (lines.length === 0) { showModal('錯誤', '名單不能為空！', 'error'); return; }
-            let newStudents = [], defaultId = 1;
+
+            const newStudents = [];
+            let defaultId = 1;
             lines.forEach(line => {
                 const match = line.match(/^(\d+)[.\s、]+(.*)$/);
+                let id, name;
                 if (match) {
-                    const id = parseInt(match[1], 10), name = match[2].trim() || '未知';
-                    newStudents.push({ id, name }); defaultId = id + 1;
-                } else { newStudents.push({ id: defaultId, name: line }); defaultId++; }
+                    id = parseInt(match[1], 10);
+                    name = match[2].trim() || '未知';
+                    defaultId = id + 1;
+                } else {
+                    id = defaultId;
+                    name = line;
+                    defaultId++;
+                }
+                // 每位學生都配一個全新的 uid，座號重複也不會共用勾選狀態
+                newStudents.push({ uid: nextUid++, id, name });
             });
+
             students.length = 0; students.push(...newStudents); statusData = {}; 
             closeImportModal(); renderStudentList(); updatePreview();
             showModal('匯入成功', `已匯入 ${newStudents.length} 位學生名單！`, 'success');
